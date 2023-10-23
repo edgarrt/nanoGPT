@@ -1,6 +1,19 @@
 
 # nanoGPT
 
+# Custom Modifications
+Implementing ALiBi on nanoGPT
+
+
+Resources used
+- Research Code [attention_with_linear_biases](https://github.com/ofirpress/attention_with_linear_biases)
+- Research Paper ([Train Short, Test Long: Attention with Linear Biases Enables Input Length Extrapolation](https://arxiv.org/pdf/2108.12409v2.pdf))
+- Youtube video - [Why and How ChatGPT Works: Building 5 Transformer Language Models at Increasing Complexity Levels](https://youtu.be/s09NPN1BSdE?si=mGKvi76H0B8bz3Og)
+  - led by original paper author 
+- Youtube video - [ALiBi enables transformer language models to handle longer inputs](https://youtu.be/Pp61ShI9VGc?si=9k-RnS3VEK1XVL5Q)
+  - led by original paper author 
+
+
 ![nanoGPT](assets/nanogpt.jpg)
 
 The simplest, fastest repository for training/finetuning medium-sized GPTs. It is a rewrite of [minGPT](https://github.com/karpathy/minGPT) that prioritizes teeth over education. Still under active development, but currently the file `train.py` reproduces GPT-2 (124M) on OpenWebText, running on a single 8XA100 40GB node in about 4 days of training. The code itself is plain and readable: `train.py` is a ~300-line boilerplate training loop and `model.py` a ~300-line GPT model definition, which can optionally load the GPT-2 weights from OpenAI. That's it.

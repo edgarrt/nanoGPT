@@ -26,6 +26,100 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+
+class ALiBiAttention(nn.Module):
+    """
+        To extend NanoGPT with Attention with Linear Biases (ALiBi) meant
+        that a new Attention module had to be swapable with the current CasualSelfAttn
+        
+        This meant I followed the similar pattern from the existing CasualSelfAttn
+    """
+    def __init__(self, config):
+        super(ALiBiAttention, self).__init__()
+
+        # Linear layers for producing query, key, and value tensors
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        
+        # Scaling factor for attention computation        
+        self.scale = 1 / math.sqrt(config.n_embd)
+
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+
+        # Precompute relative positions for attention bias
+        self.register_buffer("relative_positions", self.get_relative_positions(config.block_size))
+
+        # Compute slopes for ALiBi
+        self.register_buffer("m", self.get_slopes(self.n_head))
+
+    def get_slopes(self, n):
+        """
+            Compute slopes for ALiBi based on the number of heads.
+            
+            Ref original paper code: 
+            https://github.com/ofirpress/attention_with_linear_biases/blob/07e8a0eabfa87236395b3e4aebc790ca49f456f0/fairseq/models/transformer.py#L742
+        
+        """
+
+        # Helper function to compute slopes for powers of 2
+        def get_slopes_power_of_2(n):
+            start = (2**(-2**-(math.log2(n)-3)))
+            ratio = start
+            return [start*ratio**i for i in range(n)]
+
+        if math.log2(n).is_integer():
+            slopes = get_slopes_power_of_2(n)
+        else:
+            closest_power_of_2 = 2**math.floor(math.log2(n))
+            slopes = get_slopes_power_of_2(closest_power_of_2) + get_slopes_power_of_2(2*closest_power_of_2)[0::2][:n-closest_power_of_2]
+        
+        # Convert list to tensor        
+        slopes_tensor = torch.tensor(slopes).unsqueeze(-1).unsqueeze(-1)
+        return slopes_tensor
+
+    def get_relative_positions(self, block_size):
+        """Compute relative positions for attention bias."""
+        
+        positions = torch.arange(block_size, dtype=torch.long)
+        return positions.unsqueeze(0) - positions.unsqueeze(1)
+
+    def forward(self, x):
+        B, T, C = x.size()
+        
+        # create mask for current seq length
+        causal_mask = torch.tril(torch.ones(T, T)).unsqueeze(0).unsqueeze(0).to(x.device)
+
+        # calculate query, key, values
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+
+        # Compute ALiBi bias using relative positions and slopes
+        bias = (self.m * self.relative_positions[:x.size(1), :x.size(1)]).unsqueeze(0)
+        
+        # Attention score with ALiBi bias
+        att = ( (q @ k.transpose(-2, -1)) * self.scale ) + bias
+
+        # Apply dynamically created mask
+        att = att.masked_fill(causal_mask == 0, float("-inf"))
+
+        # Softmax over the last dimension
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+
+        y = att @ v
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -96,7 +190,11 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+
+        # Use ALiBi Attention if desired
+        match config.attention:
+            case "alibi": self.attn = ALiBiAttention(config)
+            case _: self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -114,6 +212,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    attention: str = "alibi"
 
 class GPT(nn.Module):
 
@@ -171,14 +270,26 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+
+        # Create position indices for position embeddings        
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+
+        # Conditionally add position embeddings based on attention type
+        if self.config.attention != "alibi":
+            pos_emb = self.transformer.wpe(pos) 
+            x = self.transformer.drop(tok_emb + pos_emb)
+        else:
+            # For ALiBi, just use token embeddings without adding position embeddings            
+            x = self.transformer.drop(tok_emb)
+
+        # Pass the sequence through the transformer blocks
         for block in self.transformer.h:
             x = block(x)
+
+        # Apply the final layer normalization
         x = self.transformer.ln_f(x)
 
         if targets is not None:
